@@ -505,7 +505,10 @@ fn worker_loop(shared: Arc<(Mutex<State>, Condvar)>, notifier: UnixStream) {
             (job, state.config.clone(), state.epoch)
         };
 
-        let result = {
+        // A job rejected by the cooldown must not extend the cooldown: otherwise
+        // continuous typing keeps renewing the deadline and the service never
+        // recovers after one transient failure.
+        let (result, fromCooldown) = {
             let state = lock.lock().unwrap_or_else(|error| error.into_inner());
             if state.stopping || state.epoch != epoch {
                 continue;
@@ -514,21 +517,28 @@ fn worker_loop(shared: Arc<(Mutex<State>, Condvar)>, notifier: UnixStream) {
                 .cooldown_until
                 .is_some_and(|deadline| deadline > Instant::now())
             {
-                Err(TranslationFailure {
-                    message: "translation service is cooling down after an error".to_string(),
-                    structured_output_unsupported: false,
-                })
+                (
+                    Err(TranslationFailure {
+                        message: "translation service is cooling down after an error"
+                            .to_string(),
+                        structured_output_unsupported: false,
+                    }),
+                    true,
+                )
             } else {
                 let try_structured_output = !state
                     .structured_output_unsupported
                     .contains(&backend_key(&config));
                 drop(state);
-                translate_with_fallback(
-                    &config,
-                    &job.target,
-                    &job.items,
-                    job.sentence,
-                    try_structured_output,
+                (
+                    translate_with_fallback(
+                        &config,
+                        &job.target,
+                        &job.items,
+                        job.sentence,
+                        try_structured_output,
+                    ),
+                    false,
                 )
             }
         };
@@ -568,7 +578,9 @@ fn worker_loop(shared: Arc<(Mutex<State>, Condvar)>, notifier: UnixStream) {
                         .structured_output_unsupported
                         .insert(backend_key(&config));
                 }
-                state.cooldown_until = Some(Instant::now() + Duration::from_secs(5));
+                if !fromCooldown {
+                    state.cooldown_until = Some(Instant::now() + Duration::from_secs(3));
+                }
                 output.error = error.message;
             }
         }

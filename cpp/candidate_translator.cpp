@@ -36,6 +36,8 @@ namespace {
 namespace backend = candidate_translator;
 
 constexpr char kConfigPath[] = "conf/candidate-translator.conf";
+// Matches the message the Rust worker returns while it is backing off.
+const std::string cooldown_error = "translation service is cooling down after an error";
 
 enum class TargetLanguage { English, Japanese };
 FCITX_CONFIG_ENUM_NAME_WITH_I18N(TargetLanguage, N_("English"), N_("Japanese"))
@@ -69,7 +71,7 @@ FCITX_CONFIGURATION(
         this, "DebounceMs", _("Request debounce (milliseconds)"), 180,
         fcitx::IntConstrain(0, 2000)};
     fcitx::Option<int, fcitx::IntConstrain> requestTimeoutMs{
-        this, "RequestTimeoutMs", _("Request timeout (milliseconds)"), 3000,
+        this, "RequestTimeoutMs", _("Request timeout (milliseconds)"), 8000,
         fcitx::IntConstrain(500, 15000)};
     fcitx::Option<int, fcitx::IntConstrain> cacheEntries{
         this, "CacheEntries", _("Maximum cached translations"), 2048,
@@ -648,8 +650,12 @@ private:
             sentences_.erase(sentence);
             if (!result.error.empty()) {
                 if (result.error != "translation request was superseded") {
-                    FCITX_WARN() << "Sentence translation failed: "
-                                 << std::string(result.error);
+                    if (result.error == cooldown_error) {
+                        FCITX_DEBUG() << "Sentence translation skipped during cooldown";
+                    } else {
+                        FCITX_WARN() << "Sentence translation failed: "
+                                     << std::string(result.error);
+                    }
                 }
                 return;
             }
@@ -681,7 +687,12 @@ private:
         }
         if (!result.error.empty()) {
             if (result.error != "translation request was superseded") {
-                FCITX_WARN() << "Candidate translation failed: " << std::string(result.error);
+                if (result.error == cooldown_error) {
+                    FCITX_DEBUG() << "Candidate translation skipped during cooldown";
+                } else {
+                    FCITX_WARN() << "Candidate translation failed: "
+                                 << std::string(result.error);
+                }
             }
             return;
         }
