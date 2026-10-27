@@ -82,19 +82,35 @@ FCITX_CONFIGURATION(
     fcitx::KeyListOption toggleCommitKey{
         this, "ToggleCommitKey", _("Toggle translation commit"),
         fcitx::KeyList{fcitx::Key("Control+Alt+J")},
-        fcitx::KeyListConstrain()};)
+        fcitx::KeyListConstrain()};
+    fcitx::KeyListOption sentenceKey{
+        this, "SentenceKey", _("Translate the text before the cursor"),
+        fcitx::KeyList{fcitx::Key("Control+Alt+Enter")},
+        fcitx::KeyListConstrain()};
+    fcitx::Option<int, fcitx::IntConstrain> sentenceMaxChars{
+        this, "SentenceMaxChars", _("Maximum characters per sentence"), 120,
+        fcitx::IntConstrain(10, 500)};)
 
 struct ContextState {
     std::shared_ptr<fcitx::CandidateList> list;
     std::unordered_map<std::string, std::string> translations;
     std::string signature;
     std::uint64_t currentRequest = 0;
+    // Committed Chinese, used when the client cannot report surrounding text.
+    std::string committed;
+    std::uint64_t sentenceRequest = 0;
 };
 
 struct PendingRequest {
     fcitx::InputContext *inputContext;
     std::shared_ptr<fcitx::CandidateList> list;
     std::string signature;
+};
+
+struct PendingSentence {
+    fcitx::InputContext *inputContext;
+    std::string source;
+    bool replaceSurrounding = false;
 };
 
 // Commit text is replaced only when it is exactly one of the candidates that
@@ -109,6 +125,128 @@ bool rewriteCommit(
     }
     text = translation->second;
     return true;
+}
+
+// Decodes the UTF-8 scalar at `offset`; malformed input becomes U+FFFD.
+char32_t decodeUtf8(std::string_view text, std::size_t offset, std::size_t &size) {
+    const auto byte = static_cast<unsigned char>(text[offset]);
+    if (byte < 0x80) {
+        size = 1;
+        return byte;
+    }
+    std::size_t length = 0;
+    char32_t value = 0;
+    if ((byte & 0xE0) == 0xC0) {
+        length = 2;
+        value = byte & 0x1F;
+    } else if ((byte & 0xF0) == 0xE0) {
+        length = 3;
+        value = byte & 0x0F;
+    } else if ((byte & 0xF8) == 0xF0) {
+        length = 4;
+        value = byte & 0x07;
+    } else {
+        size = 1;
+        return 0xFFFD;
+    }
+    if (offset + length > text.size()) {
+        size = 1;
+        return 0xFFFD;
+    }
+    for (std::size_t i = 1; i < length; ++i) {
+        const auto continuation = static_cast<unsigned char>(text[offset + i]);
+        if ((continuation & 0xC0) != 0x80) {
+            size = 1;
+            return 0xFFFD;
+        }
+        value = (value << 6) | (continuation & 0x3F);
+    }
+    size = length;
+    return value;
+}
+
+bool isHan(char32_t character) {
+    return (character >= 0x3400 && character <= 0x4DBF) ||
+           (character >= 0x4E00 && character <= 0x9FFF) ||
+           (character >= 0xF900 && character <= 0xFAFF) ||
+           (character >= 0x20000 && character <= 0x3FFFF);
+}
+
+// Characters that make up a translatable run: CJK, Latin letters, digits and
+// everyday punctuation, but never a line break.
+bool isSentenceChar(char32_t character) {
+    if (character == U'\n' || character == U'\r' || character == U'\t') {
+        return false;
+    }
+    if (character < 0x80) {
+        if ((character >= U'a' && character <= U'z') ||
+            (character >= U'A' && character <= U'Z') ||
+            (character >= U'0' && character <= U'9')) {
+            return true;
+        }
+        constexpr std::string_view ascii = " ,.!?;:'-()<>@/";
+        return ascii.find(static_cast<char>(character)) !=
+               std::string_view::npos;
+    }
+    if (character >= 0x3000 && character <= 0x303F) {
+        return true;
+    }
+    if (character >= 0xFF01 && character <= 0xFF5E) {
+        return true;
+    }
+    return isHan(character);
+}
+
+std::size_t sentenceCharacterCount(std::string_view text) {
+    std::size_t count = 0;
+    std::size_t offset = 0;
+    while (offset < text.size()) {
+        std::size_t size = 1;
+        decodeUtf8(text, offset, size);
+        offset += size;
+        ++count;
+    }
+    return count;
+}
+
+// Returns the run of translatable characters ending at `cursor` (an offset in
+// characters), capped to `maxCharacters`.
+std::string extractSentence(std::string_view text, unsigned int cursor,
+                            int maxCharacters) {
+    if (text.empty() || maxCharacters <= 0) {
+        return {};
+    }
+    std::vector<std::size_t> offsets;
+    std::vector<char32_t> points;
+    offsets.reserve(text.size() + 1);
+    points.reserve(text.size());
+    for (std::size_t offset = 0; offset < text.size();) {
+        std::size_t size = 1;
+        points.push_back(decodeUtf8(text, offset, size));
+        offsets.push_back(offset);
+        offset += size;
+    }
+    offsets.push_back(text.size());
+    if (cursor > points.size()) {
+        cursor = static_cast<unsigned int>(points.size());
+    }
+    std::size_t begin = cursor;
+    std::size_t count = 0;
+    while (begin > 0 && count < static_cast<std::size_t>(maxCharacters)) {
+        if (!isSentenceChar(points[begin - 1])) {
+            break;
+        }
+        --begin;
+        ++count;
+    }
+    // Leading spaces are padding, not part of the text to translate.
+    while (begin < cursor && text[offsets[begin]] == ' ') {
+        ++begin;
+    }
+    if (begin >= cursor) {
+        return {};
+    }
+    return std::string(text.substr(offsets[begin], offsets[cursor] - offsets[begin]));
 }
 
 backend::Candidate prepareCandidate(std::uint32_t index, std::string_view source) {
@@ -252,6 +390,7 @@ private:
         translator_->cancel_requests();
         contexts_.clear();
         pending_.clear();
+        sentences_.clear();
         commitToggled_.clear();
     }
 
@@ -259,6 +398,9 @@ private:
         contexts_.erase(inputContext);
         commitToggled_.erase(inputContext);
         std::erase_if(pending_, [inputContext](const auto &entry) {
+            return entry.second.inputContext == inputContext;
+        });
+        std::erase_if(sentences_, [inputContext](const auto &entry) {
             return entry.second.inputContext == inputContext;
         });
     }
@@ -281,7 +423,11 @@ private:
     // replacing the text here turns "type Chinese, accept" into English without
     // intercepting the key that accepted the candidate.
     void filterCommit(fcitx::InputContext *inputContext, std::string &text) {
-        if (text.empty() || !commitTranslationActive(inputContext)) {
+        if (text.empty()) {
+            return;
+        }
+        recordCommitted(inputContext, text);
+        if (!commitTranslationActive(inputContext)) {
             return;
         }
         const auto state = contexts_.find(inputContext);
@@ -290,17 +436,64 @@ private:
         }
     }
 
-    void handleKeyEvent(fcitx::KeyEvent &event) {
-        if (event.isRelease() || event.filtered() || event.accepted() ||
-            *config_.commitMode != CommitMode::Toggle) {
+    // Keeps the text the user has already committed, for clients that do not
+    // report surrounding text, where the sentence cannot be replaced in place.
+    void recordCommitted(fcitx::InputContext *inputContext,
+                         const std::string &text) {
+        if (inputContext->capabilityFlags().testAny(
+                fcitx::CapabilityFlag::PasswordOrSensitive)) {
             return;
         }
-        const auto &keys = *config_.toggleCommitKey;
-        if (keys.empty() || !event.key().checkKeyList(keys)) {
+        bool hasHan = false;
+        for (std::size_t offset = 0; offset < text.size();) {
+            std::size_t size = 1;
+            const auto character = decodeUtf8(text, offset, size);
+            offset += size;
+            if (isHan(character)) {
+                hasHan = true;
+                break;
+            }
+        }
+        if (!hasHan) {
+            return;
+        }
+        auto &buffer = contexts_[inputContext].committed;
+        buffer += text;
+        const auto limit =
+            static_cast<std::size_t>(*config_.sentenceMaxChars);
+        if (sentenceCharacterCount(buffer) <= limit) {
+            return;
+        }
+        std::size_t excess = sentenceCharacterCount(buffer) - limit;
+        std::size_t offset = 0;
+        while (offset < buffer.size() && excess > 0) {
+            std::size_t size = 1;
+            decodeUtf8(buffer, offset, size);
+            offset += size;
+            --excess;
+        }
+        buffer.erase(0, offset);
+    }
+
+    void handleKeyEvent(fcitx::KeyEvent &event) {
+        if (event.isRelease() || event.filtered() || event.accepted()) {
             return;
         }
         auto *inputContext = event.inputContext();
-        if (!inputContext || !inputContext->hasFocus() ||
+        if (!inputContext || !inputContext->hasFocus()) {
+            return;
+        }
+        const auto &sentenceKeys = *config_.sentenceKey;
+        if (!sentenceKeys.empty() && event.key().checkKeyList(sentenceKeys)) {
+            event.filterAndAccept();
+            translateSentence(inputContext);
+            return;
+        }
+        if (*config_.commitMode != CommitMode::Toggle) {
+            return;
+        }
+        const auto &keys = *config_.toggleCommitKey;
+        if (keys.empty() || !event.key().checkKeyList(keys) ||
             inputContext->capabilityFlags().testAny(
                 fcitx::CapabilityFlag::PasswordOrSensitive)) {
             return;
@@ -310,6 +503,61 @@ private:
         event.filterAndAccept();
         inputContext->updateUserInterface(
             fcitx::UserInterfaceComponent::InputPanel);
+    }
+
+    // Translates the run of text ending at the cursor and replaces it in place.
+    void translateSentence(fcitx::InputContext *inputContext) {
+        if (!configured() ||
+            inputContext->capabilityFlags().testAny(
+                fcitx::CapabilityFlag::PasswordOrSensitive)) {
+            return;
+        }
+        auto &state = contexts_[inputContext];
+        std::string source;
+        if (const auto &surrounding = inputContext->surroundingText();
+            surrounding.isValid()) {
+            source = extractSentence(surrounding.text(), surrounding.cursor(),
+                                     *config_.sentenceMaxChars);
+        }
+        const bool replaceSurrounding = !source.empty();
+        if (!replaceSurrounding) {
+            source = state.committed;
+        }
+        if (source.empty()) {
+            return;
+        }
+        if (const auto cached = translator_->lookup(targetLanguage(), source);
+            !cached.empty()) {
+            applySentence(inputContext, source, std::string(cached),
+                          replaceSurrounding);
+            return;
+        }
+        const auto requestId = nextRequestId_++;
+        if (state.sentenceRequest != 0) {
+            sentences_.erase(state.sentenceRequest);
+        }
+        state.sentenceRequest = requestId;
+        sentences_.insert_or_assign(
+            requestId, PendingSentence{inputContext, source, replaceSurrounding});
+        translator_->submit_text(requestId, targetLanguage(), source);
+    }
+
+    void applySentence(fcitx::InputContext *inputContext,
+                       const std::string &source, std::string translation,
+                       bool replaceSurrounding) {
+        if (auto state = contexts_.find(inputContext); state != contexts_.end()) {
+            state->second.sentenceRequest = 0;
+            state->second.committed.clear();
+        }
+        if (replaceSurrounding) {
+            const auto length =
+                static_cast<unsigned int>(sentenceCharacterCount(source));
+            if (length > 0) {
+                inputContext->deleteSurroundingText(-static_cast<int>(length),
+                                                    length);
+            }
+        }
+        inputContext->commitString(translation);
     }
 
     void filterOutput(fcitx::InputContext *inputContext, fcitx::Text &text) {
@@ -394,6 +642,26 @@ private:
     }
 
     void applyResult(backend::TranslationResult result) {
+        if (auto sentence = sentences_.find(result.request_id);
+            sentence != sentences_.end()) {
+            auto request = std::move(sentence->second);
+            sentences_.erase(sentence);
+            if (!result.error.empty()) {
+                if (result.error != "translation request was superseded") {
+                    FCITX_WARN() << "Sentence translation failed: "
+                                 << std::string(result.error);
+                }
+                return;
+            }
+            if (result.translations.empty() ||
+                result.translations[0].text.empty()) {
+                return;
+            }
+            applySentence(request.inputContext, request.source,
+                          std::string(result.translations[0].text),
+                          request.replaceSurrounding);
+            return;
+        }
         auto pending = pending_.find(result.request_id);
         if (pending == pending_.end()) {
             return;
@@ -440,6 +708,7 @@ private:
     std::unordered_map<fcitx::InputContext *, ContextState> contexts_;
     std::unordered_map<fcitx::InputContext *, bool> commitToggled_;
     std::unordered_map<std::uint64_t, PendingRequest> pending_;
+    std::unordered_map<std::uint64_t, PendingSentence> sentences_;
     std::uint64_t nextRequestId_ = 1;
     rust::Box<backend::Translator> translator_;
     // Destruction order matters: the watcher must die before its borrowed fd.
@@ -477,6 +746,30 @@ bool candidate_translator::cpp_commit_rewrite_test() {
         }
     }
     return true;
+}
+
+bool candidate_translator::cpp_sentence_extract_test() {
+    const std::string mixed = "hello 我用Linux写代码。";
+    // Every character forms one run while the budget allows it.
+    if (extractSentence(mixed, 17, 120) != mixed) {
+        return false;
+    }
+    // Over budget, only the tail closest to the cursor survives.
+    if (extractSentence(mixed, 17, 3) != "代码。") {
+        return false;
+    }
+    // A line break terminates the run.
+    const std::string lines = "first line\n第二行";
+    if (extractSentence(lines, 14, 120) != "第二行") {
+        return false;
+    }
+    // Nothing before the cursor yields no request.
+    if (!extractSentence(mixed, 0, 120).empty() ||
+        !extractSentence("", 0, 120).empty()) {
+        return false;
+    }
+    // A cursor past the end is clamped instead of read out of bounds.
+    return extractSentence(mixed, 999, 120) == mixed;
 }
 
 bool candidate_translator::cpp_candidate_validation_test() {

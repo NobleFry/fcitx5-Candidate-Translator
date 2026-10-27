@@ -46,6 +46,8 @@ pub mod ffi {
         // An empty string denotes a miss; translations are never empty.
         fn lookup(self: &Translator, target: &str, source: &str) -> String;
         fn submit(self: &Translator, request_id: u64, target: &str, items: Vec<Candidate>);
+        // Whole-sentence translation: no candidate policy, no debounce.
+        fn submit_text(self: &Translator, request_id: u64, target: &str, text: &str);
         fn cancel_requests(self: &Translator);
         fn clear_cache(self: &Translator);
         // Borrowed descriptor: watch for readability, but do not close or read it.
@@ -66,6 +68,8 @@ pub mod ffi {
         fn cpp_candidate_validation_test() -> bool;
         #[allow(dead_code)]
         fn cpp_commit_rewrite_test() -> bool;
+        #[allow(dead_code)]
+        fn cpp_sentence_extract_test() -> bool;
         #[allow(dead_code)]
         fn cpp_wait_for_results(translator: &Translator) -> Vec<TranslationResult>;
     }

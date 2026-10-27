@@ -10,7 +10,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use url::Url;
@@ -56,6 +56,9 @@ struct Job {
     target: String,
     items: Vec<JobItem>,
     ready_at: Instant,
+    // Sentence jobs carry one item of arbitrary length, skip the candidate
+    // prompt and structured output, and are not debounced.
+    sentence: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -520,7 +523,13 @@ fn worker_loop(shared: Arc<(Mutex<State>, Condvar)>, notifier: UnixStream) {
                     .structured_output_unsupported
                     .contains(&backend_key(&config));
                 drop(state);
-                translate_with_fallback(&config, &job.target, &job.items, try_structured_output)
+                translate_with_fallback(
+                    &config,
+                    &job.target,
+                    &job.items,
+                    job.sentence,
+                    try_structured_output,
+                )
             }
         };
 
@@ -581,12 +590,127 @@ fn validate_url(base_url: &str) -> Result<String, String> {
     ))
 }
 
+// Reusing one Client keeps the TLS connection and its handshake cache alive;
+// building a Client per request costs hundreds of milliseconds.
+fn http_client(timeout: Duration) -> Result<Client, String> {
+    static CLIENTS: OnceLock<Mutex<HashMap<u64, Client>>> = OnceLock::new();
+    let clients = CLIENTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = timeout.as_millis() as u64;
+    let mut guard = clients.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(client) = guard.get(&key) {
+        return Ok(client.clone());
+    }
+    let client = Client::builder()
+        .connect_timeout(timeout.min(Duration::from_secs(2)))
+        .timeout(timeout)
+        .build()
+        .map_err(|error| error.to_string())?;
+    guard.insert(key, client.clone());
+    Ok(client)
+}
+
+fn parse_plain_translation(
+    content: &str,
+    items: &[JobItem],
+) -> Result<Vec<(u32, String, String)>, String> {
+    let item = items
+        .first()
+        .ok_or_else(|| "translation request had no text".to_string())?;
+    let mut text = content.trim();
+    if let Some(rest) = text.strip_prefix("```") {
+        text = rest
+            .split_once('\n')
+            .map(|(_, body)| body)
+            .unwrap_or(rest)
+            .trim_end()
+            .trim_end_matches("```")
+            .trim();
+    }
+    let text = text
+        .trim_matches(|character| matches!(character, '"' | '\'' | '“' | '”' | '「' | '」'))
+        .trim();
+    if text.is_empty() {
+        return Err("translation response was empty".into());
+    }
+    Ok(vec![(item.index, item.source.clone(), text.to_string())])
+}
+
+// Whole-sentence mode translates the text as a unit and answers in plain text,
+// so there is no candidate JSON, no response_format, and a bounded output size.
+fn translate_sentence(
+    config: &Config,
+    target: &str,
+    items: &[JobItem],
+) -> Result<Vec<(u32, String, String)>, String> {
+    if !config.ready() {
+        return Err("translation API is not fully configured".into());
+    }
+    let item = items
+        .first()
+        .ok_or_else(|| "translation request had no text".to_string())?;
+    let endpoint = validate_url(&config.base_url)?;
+    let target_name = if target == "JapaneseWithKana" {
+        "Japanese"
+    } else {
+        target
+    };
+    let system = format!(
+        "Translate the user's text into {target_name}. Reply with the translation only: no explanations, no notes, no quotation marks, no JSON."
+    );
+    let mut body = json!({
+        "model": config.model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": item.source}
+        ],
+        "stream": false,
+        "max_tokens": (128 + 3 * item.source.chars().count()).min(1024)
+    });
+    if !config.reasoning_effort.is_empty() {
+        body["reasoning_effort"] = Value::String(config.reasoning_effort.clone());
+    }
+    let client = http_client(config.timeout)?;
+    let response = client
+        .post(endpoint)
+        .bearer_auth(&config.api_key)
+        .json(&body)
+        .send()
+        .map_err(|error| format!("translation request failed: {error}"))?;
+    let status = response.status();
+    let response_body = response
+        .text()
+        .map_err(|error| format!("failed to read response: {error}"))?;
+    if !status.is_success() {
+        return Err(http_error_message(status, &response_body));
+    }
+    let payload: Value = serde_json::from_str(&response_body)
+        .map_err(|error| format!("invalid chat completion JSON: {error}"))?;
+    let content = payload
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "chat completion did not contain message content".to_string())?;
+    parse_plain_translation(content, items)
+}
+
 fn translate_with_fallback(
     config: &Config,
     target: &str,
     items: &[JobItem],
+    sentence: bool,
     try_structured_output: bool,
 ) -> Result<TranslationBatch, TranslationFailure> {
+    if sentence {
+        return match translate_sentence(config, target, items) {
+            Ok(translations) => Ok(TranslationBatch {
+                translations,
+                structured_output_unsupported: false,
+            }),
+            Err(message) => Err(TranslationFailure {
+                message,
+                structured_output_unsupported: false,
+            }),
+        };
+    }
     if try_structured_output {
         match translate_attempt(config, target, items, true) {
             Ok(translations) => {
@@ -738,11 +862,7 @@ fn translate_attempt(
     if !config.reasoning_effort.is_empty() {
         body["reasoning_effort"] = Value::String(config.reasoning_effort.clone());
     }
-    let client = Client::builder()
-        .connect_timeout(config.timeout.min(Duration::from_secs(2)))
-        .timeout(config.timeout)
-        .build()
-        .map_err(|error| AttemptError::Other(error.to_string()))?;
+    let client = http_client(config.timeout).map_err(AttemptError::Other)?;
     let response = client
         .post(endpoint)
         .bearer_auth(&config.api_key)
@@ -970,6 +1090,44 @@ impl Translator {
             target: target.into(),
             items,
             ready_at: Instant::now() + state.config.debounce,
+            sentence: false,
+        };
+        if let Some(replaced) = state.pending.replace(job) {
+            state.results.push(TranslationResult {
+                request_id: replaced.request_id,
+                translations: Vec::new(),
+                error: "translation request was superseded".into(),
+            });
+            notify(&self.notifier);
+        }
+        condvar.notify_all();
+    }
+
+    // Translates one whole sentence. Unlike submit(), this bypasses the
+    // 32-character/one-Han-character candidate policy and fires immediately.
+    fn submit_text(&self, request_id: u64, target: &str, text: &str) {
+        let trimmed = text.trim();
+        let (lock, condvar) = &*self.shared;
+        let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
+        if trimmed.is_empty() || !state.config.ready() {
+            state.results.push(TranslationResult {
+                request_id,
+                translations: Vec::new(),
+                error: "invalid sentence translation request or incomplete configuration"
+                    .into(),
+            });
+            notify(&self.notifier);
+            return;
+        }
+        let job = Job {
+            request_id,
+            target: target.into(),
+            items: vec![JobItem {
+                index: 0,
+                source: trimmed.to_string(),
+            }],
+            ready_at: Instant::now(),
+            sentence: true,
         };
         if let Some(replaced) = state.pending.replace(job) {
             state.results.push(TranslationResult {
@@ -1288,6 +1446,53 @@ mod tests {
     }
 
     #[test]
+    fn cpp_extracts_sentence_before_cursor() {
+        assert!(bridge::ffi::cpp_sentence_extract_test());
+    }
+
+    #[test]
+    fn sentence_translation_bypasses_candidate_limits() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (request_tx, request_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            request_tx.send(read_http_request(&mut stream)).unwrap();
+            let payload = json!({
+                "choices": [{"message": {"content": "  Hello, long sentence.\n"}}]
+            });
+            write_json_response(&mut stream, "200 OK", &payload);
+        });
+        let translator = new_translator().unwrap();
+        translator.configure(backend_config(&base_url));
+        // Far longer than the 32-character candidate limit.
+        let long = "我今天想去北京看朋友".repeat(4);
+        translator.submit_text(9, "English", &long);
+        let results = bridge::ffi::cpp_wait_for_results(&translator);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].request_id, 9);
+        assert!(results[0].error.is_empty(), "{}", results[0].error);
+        assert_eq!(results[0].translations.len(), 1);
+        assert_eq!(
+            results[0].translations[0].text.as_str(),
+            "Hello, long sentence."
+        );
+        let body = request_json(&request_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        assert!(body.get("response_format").is_none());
+        assert_eq!(body["messages"][1]["content"].as_str(), Some(long.as_str()));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn empty_sentence_request_reports_an_error_without_http() {
+        let translator = new_translator().unwrap();
+        translator.configure(backend_config("http://127.0.0.1:9"));
+        translator.submit_text(4, "English", "   ");
+        let results = bridge::ffi::cpp_wait_for_results(&translator);
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].error.is_empty());
+    }
+    #[test]
     fn rejected_candidate_batch_does_not_send_http_request() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -1549,7 +1754,7 @@ mod tests {
             timeout: Duration::from_secs(2),
             ..Config::default()
         };
-        let batch = translate_with_fallback(&config, "JapaneseWithKana", &items(), true).unwrap();
+        let batch = translate_with_fallback(&config, "JapaneseWithKana", &items(), false, true).unwrap();
         let output = batch.translations;
         assert_eq!(
             output[0],
@@ -1622,7 +1827,7 @@ mod tests {
             timeout: Duration::from_secs(2),
             ..Config::default()
         };
-        let batch = translate_with_fallback(&config, "English", &items(), true).unwrap();
+        let batch = translate_with_fallback(&config, "English", &items(), false, true).unwrap();
         assert!(batch.structured_output_unsupported);
         assert_eq!(batch.translations[0].2, "recite words");
 

@@ -76,6 +76,8 @@ Linux 上打开 `fcitx5-configtool`，返回主界面的“附加组件 / Addons
 - `Reasoning effort`：GPT-5.6 Luna 建议选择 `None`，减少候选翻译延迟；其他模型不支持该参数时选择 `Auto`。
 - `Commit mode`：`Never`（默认，仅显示译文）、`When toggled on`（按快捷键切换后，接受候选时上屏的是译文）、`Always`（候选只要已有译文就上屏译文）。
 - `Toggle translation commit`：`When toggled on` 模式下的切换快捷键，默认 `Control+Alt+J`。
+- `Translate the text before the cursor`：整句翻译快捷键，默认 `Control+Alt+Enter`，见下文。
+- `Maximum characters per sentence`：整句翻译最多取多少个字符，默认 120。
 
 三个接口字段默认留空，未填写完整前不会发送请求。API Key 按需求明文保存在 `~/.config/fcitx5/conf/candidate-translator.conf`；插件会尽力将该文件权限收紧为 `0600`，但仍不建议在共享账户中使用长期高权限密钥。
 
@@ -90,6 +92,25 @@ Linux 上打开 `fcitx5-configtool`，返回主界面的“附加组件 / Addons
 - 切换状态按输入框独立保存，输入框关闭即清除；密码和敏感输入框既不会上屏译文，也不会响应切换快捷键。
 - 机制上不拦截接受候选的那次按键：fcitx5 的 `InputContext::commitString` 会把每个提交串送进 `Instance::CommitFilter`，插件用该输入框的「候选原文 → 译文」表做精确匹配，命中才替换。因此标点、英文、表情等非候选提交，以及译文与原文相同的情况都不会被改动。
 - 该模式依赖 fcitx5 5.1.20+，与具体输入法无关，fcitx5-pinyin、fcitx5-rime 等都能用；候选窗显示仍是候选级延迟，上屏只使用已经缓存的译文，不会为了上屏而同步请求接口。
+
+## 整句翻译
+
+候选级翻译只覆盖候选词，长句要逐词输入。整句翻译补上这一段：先把中文打完整，再按 `Control+Alt+Enter`，插件取光标前的整段文字翻译，并用译文替换它。
+
+- 取文本：优先用客户端的 surrounding text，从光标往前走，最多 `Maximum characters per sentence` 个字符；遇到换行停止；允许汉字、中文标点、全角符号、英文字母、数字和常见半角标点，开头空格会被丢掉。
+- 替换：拿到译文后调用 `InputContext::deleteSurroundingText` 删掉原文，再 `commitString` 上屏译文，所以在支持 surrounding text 的程序里是「原地翻译」。
+- 不支持 surrounding text 的客户端（部分 Wayland 应用）：退化为「累积已上屏的中文」，此时只能把译文追加在光标处，中文原文需要自己删掉。
+- 结果走同一个缓存；命中缓存时立即替换，不发请求。
+- 整句请求不防抖，一次按键一次请求；prompt 要求只返回译文本身，并带 `max_tokens` 上限，避免长篇解释。
+- 密码和敏感输入框不响应该快捷键。
+
+### 延迟优化
+
+- 请求复用同一个 HTTP 客户端，省掉每次请求的 TLS 握手（通常 200–600ms）。
+- 缓存命中不发请求：整句重复出现时是即时的。
+- 缓存键包含 Base URL、模型、推理档位、目标语言和原文，换模型或换档位会各存一份。
+- DeepSeek 这类默认开启思考的模型，单次延迟主要来自推理本身：把 `Reasoning effort` 设为 `None`（或服务支持的最低档）能明显变快；整句请求本身已经限制了输出长度。
+- `Request timeout` 默认 3 秒，整句翻译在慢模型上可能超时，可以调到 5–15 秒。
 
 ## 接口约定
 

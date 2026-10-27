@@ -13,5 +13,6 @@ fcitx::AddonFactory *addon_factory();
 bool cpp_self_test();
 bool cpp_candidate_validation_test();
 bool cpp_commit_rewrite_test();
+bool cpp_sentence_extract_test();
 rust::Vec<TranslationResult> cpp_wait_for_results(const Translator &translator);
 } // namespace candidate_translator
