@@ -1511,6 +1511,11 @@ mod tests {
     }
 
     #[test]
+    fn cpp_commit_rewrite_only_replaces_translated_candidates() {
+        assert!(bridge::ffi::cpp_commit_rewrite_test());
+    }
+
+    #[test]
     fn calls_chat_completions_and_maps_indices() {
         let listener = match TcpListener::bind("127.0.0.1:0") {
             Ok(listener) => listener,

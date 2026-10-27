@@ -2,7 +2,7 @@
 
 给 fcitx5 各输入法中包含汉字的候选词追加英语或日语翻译。
 
-Linux 插件通过 fcitx5 官方 `OutputFilter` 仅装饰发送给候选窗的文本副本，不修改输入法拥有的候选对象，也不会改变实际提交内容。
+Linux 插件通过 fcitx5 官方 `OutputFilter` 仅装饰发送给候选窗的文本副本，不修改输入法拥有的候选对象，默认也不会改变实际提交内容。可选的「提交译文」模式会在提交时通过官方 `CommitFilter` 用译文替代中文，见[提交译文](#提交译文)；未开启时行为与之前完全一致。
 
 1–4 个汉字的短词会优先查询随包安装的 MJdic 离线词典，命中后立即显示；日语读音由本地 Kakasi 生成。词典和持久缓存都未命中时，才调用远程 API。
 
@@ -74,10 +74,22 @@ Linux 上打开 `fcitx5-configtool`，返回主界面的“附加组件 / Addons
 - `Target language`：English 或 Japanese。
 - `Show kana reading for Japanese translations`：日语翻译后追加平假名读音，默认开启，例如 `単語を暗記する（たんごをあんきする）`。
 - `Reasoning effort`：GPT-5.6 Luna 建议选择 `None`，减少候选翻译延迟；其他模型不支持该参数时选择 `Auto`。
+- `Commit mode`：`Never`（默认，仅显示译文）、`When toggled on`（按快捷键切换后，接受候选时上屏的是译文）、`Always`（候选只要已有译文就上屏译文）。
+- `Toggle translation commit`：`When toggled on` 模式下的切换快捷键，默认 `Control+Alt+J`。
 
 三个接口字段默认留空，未填写完整前不会发送请求。API Key 按需求明文保存在 `~/.config/fcitx5/conf/candidate-translator.conf`；插件会尽力将该文件权限收紧为 `0600`，但仍不建议在共享账户中使用长期高权限密钥。
 
 翻译缓存保存在 `~/.cache/fcitx5/candidate-translator/cache-v1.json`，不包含 API Key。配置页勾选 `Clear translation cache on Apply` 后应用，可以清空缓存。
+
+## 提交译文
+
+`Commit mode` 让插件把「输入中文、接受候选」变成「上屏英文」：
+
+- 只替换已经有译文的候选。译文来自持久缓存或随包 MJdic 短词词典，尚未拿到译文时仍然上屏中文，输入不会被阻塞。
+- 开启上屏的输入框里，可上屏的候选前面会多一个 `→` 标记，译文改为下划线样式，便于区分「只是提示」和「真的会替换」。
+- 切换状态按输入框独立保存，输入框关闭即清除；密码和敏感输入框既不会上屏译文，也不会响应切换快捷键。
+- 机制上不拦截接受候选的那次按键：fcitx5 的 `InputContext::commitString` 会把每个提交串送进 `Instance::CommitFilter`，插件用该输入框的「候选原文 → 译文」表做精确匹配，命中才替换。因此标点、英文、表情等非候选提交，以及译文与原文相同的情况都不会被改动。
+- 该模式依赖 fcitx5 5.1.20+，与具体输入法无关，fcitx5-pinyin、fcitx5-rime 等都能用；候选窗显示仍是候选级延迟，上屏只使用已经缓存的译文，不会为了上屏而同步请求接口。
 
 ## 接口约定
 

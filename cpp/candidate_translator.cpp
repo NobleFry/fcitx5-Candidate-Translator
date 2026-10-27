@@ -16,6 +16,7 @@
 #include <fcitx-config/iniparser.h>
 #include <fcitx-utils/capabilityflags.h>
 #include <fcitx-utils/i18n.h>
+#include <fcitx-utils/key.h>
 #include <fcitx-utils/log.h>
 #include <fcitx-utils/standardpaths.h>
 #include <fcitx-utils/event.h>
@@ -42,6 +43,10 @@ FCITX_CONFIG_ENUM_NAME_WITH_I18N(TargetLanguage, N_("English"), N_("Japanese"))
 enum class ReasoningEffortMode { Auto, None, Low, Medium };
 FCITX_CONFIG_ENUM_NAME_WITH_I18N(ReasoningEffortMode, N_("Auto"), N_("None"),
                                  N_("Low"), N_("Medium"))
+
+enum class CommitMode { Off, Toggle, Always };
+FCITX_CONFIG_ENUM_NAME_WITH_I18N(CommitMode, N_("Never"),
+                                 N_("When toggled on"), N_("Always"))
 
 FCITX_CONFIGURATION(
     TranslatorConfig,
@@ -70,7 +75,14 @@ FCITX_CONFIGURATION(
         this, "CacheEntries", _("Maximum cached translations"), 2048,
         fcitx::IntConstrain(0, 100000)};
     fcitx::Option<bool> clearCache{
-        this, "ClearCache", _("Clear translation cache on Apply"), false};)
+        this, "ClearCache", _("Clear translation cache on Apply"), false};
+    fcitx::OptionWithAnnotation<CommitMode, CommitModeI18NAnnotation> commitMode{
+        this, "CommitMode",
+        _("Commit the translation instead of the typed Chinese"), CommitMode::Off};
+    fcitx::KeyListOption toggleCommitKey{
+        this, "ToggleCommitKey", _("Toggle translation commit"),
+        fcitx::KeyList{fcitx::Key("Control+Alt+J")},
+        fcitx::KeyListConstrain()};)
 
 struct ContextState {
     std::shared_ptr<fcitx::CandidateList> list;
@@ -84,6 +96,20 @@ struct PendingRequest {
     std::shared_ptr<fcitx::CandidateList> list;
     std::string signature;
 };
+
+// Commit text is replaced only when it is exactly one of the candidates that
+// already holds a different translation.
+bool rewriteCommit(
+    const std::unordered_map<std::string, std::string> &translations,
+    std::string &text) {
+    const auto translation = translations.find(text);
+    if (translation == translations.end() || translation->second.empty() ||
+        translation->second == text) {
+        return false;
+    }
+    text = translation->second;
+    return true;
+}
 
 backend::Candidate prepareCandidate(std::uint32_t index, std::string_view source) {
     return backend::prepare_candidate(
@@ -112,6 +138,16 @@ public:
             [this](fcitx::InputContext *inputContext, fcitx::Text &text) {
                 filterOutput(inputContext, text);
             });
+        commitConnection_ = instance_->connect<fcitx::Instance::CommitFilter>(
+            [this](fcitx::InputContext *inputContext, std::string &text) {
+                filterCommit(inputContext, text);
+            });
+        handlers_.emplace_back(instance_->watchEvent(
+            fcitx::EventType::InputContextKeyEvent,
+            fcitx::EventWatcherPhase::PreInputMethod,
+            [this](fcitx::Event &event) {
+                handleKeyEvent(static_cast<fcitx::KeyEvent &>(event));
+            }));
         handlers_.emplace_back(instance_->watchEvent(
             fcitx::EventType::InputContextUpdateUI,
             fcitx::EventWatcherPhase::Default,
@@ -134,6 +170,7 @@ public:
         // Unregister the borrowed fd before Translator joins its worker and
         // closes the sockets. Background work never accesses this addon.
         resultEvent_.reset();
+        commitConnection_.disconnect();
         clearAll();
     }
 
@@ -215,13 +252,64 @@ private:
         translator_->cancel_requests();
         contexts_.clear();
         pending_.clear();
+        commitToggled_.clear();
     }
 
     void removeInputContext(fcitx::InputContext *inputContext) {
         contexts_.erase(inputContext);
+        commitToggled_.erase(inputContext);
         std::erase_if(pending_, [inputContext](const auto &entry) {
             return entry.second.inputContext == inputContext;
         });
+    }
+
+    bool commitTranslationActive(fcitx::InputContext *inputContext) const {
+        switch (*config_.commitMode) {
+        case CommitMode::Always:
+            return true;
+        case CommitMode::Toggle: {
+            const auto toggled = commitToggled_.find(inputContext);
+            return toggled != commitToggled_.end() && toggled->second;
+        }
+        case CommitMode::Off:
+            break;
+        }
+        return false;
+    }
+
+    // InputContext::commitString routes every commit through this filter, so
+    // replacing the text here turns "type Chinese, accept" into English without
+    // intercepting the key that accepted the candidate.
+    void filterCommit(fcitx::InputContext *inputContext, std::string &text) {
+        if (text.empty() || !commitTranslationActive(inputContext)) {
+            return;
+        }
+        const auto state = contexts_.find(inputContext);
+        if (state != contexts_.end()) {
+            rewriteCommit(state->second.translations, text);
+        }
+    }
+
+    void handleKeyEvent(fcitx::KeyEvent &event) {
+        if (event.isRelease() || event.filtered() || event.accepted() ||
+            *config_.commitMode != CommitMode::Toggle) {
+            return;
+        }
+        const auto &keys = *config_.toggleCommitKey;
+        if (keys.empty() || !event.key().checkKeyList(keys)) {
+            return;
+        }
+        auto *inputContext = event.inputContext();
+        if (!inputContext || !inputContext->hasFocus() ||
+            inputContext->capabilityFlags().testAny(
+                fcitx::CapabilityFlag::PasswordOrSensitive)) {
+            return;
+        }
+        auto &active = commitToggled_[inputContext];
+        active = !active;
+        event.filterAndAccept();
+        inputContext->updateUserInterface(
+            fcitx::UserInterfaceComponent::InputPanel);
     }
 
     void filterOutput(fcitx::InputContext *inputContext, fcitx::Text &text) {
@@ -239,7 +327,12 @@ private:
             return;
         }
         text.append("  ");
-        text.append(translation->second, fcitx::TextFormatFlag::Italic);
+        if (commitTranslationActive(inputContext)) {
+            text.append("→ ", fcitx::TextFormatFlag::Bold);
+            text.append(translation->second, fcitx::TextFormatFlag::Underline);
+        } else {
+            text.append(translation->second, fcitx::TextFormatFlag::Italic);
+        }
     }
 
     void updateInputContext(fcitx::InputContext *inputContext) {
@@ -341,9 +434,11 @@ private:
     fcitx::Instance *instance_;
     TranslatorConfig config_;
     fcitx::Connection outputConnection_;
+    fcitx::Connection commitConnection_;
     std::vector<std::unique_ptr<fcitx::HandlerTableEntry<fcitx::EventHandler>>>
         handlers_;
     std::unordered_map<fcitx::InputContext *, ContextState> contexts_;
+    std::unordered_map<fcitx::InputContext *, bool> commitToggled_;
     std::unordered_map<std::uint64_t, PendingRequest> pending_;
     std::uint64_t nextRequestId_ = 1;
     rust::Box<backend::Translator> translator_;
@@ -365,6 +460,23 @@ bool candidate_translator::cpp_self_test() {
     display.append("  ");
     display.append("translation", fcitx::TextFormatFlag::Italic);
     return display.toString() == "candidate  translation";
+}
+
+bool candidate_translator::cpp_commit_rewrite_test() {
+    const std::unordered_map<std::string, std::string> translations{
+        {"汉字", "Chinese character"}, {"相同", "相同"}, {"空", ""}};
+    std::string text = "汉字";
+    if (!rewriteCommit(translations, text) || text != "Chinese character") {
+        return false;
+    }
+    // Untranslated, identical, and empty results keep the typed text.
+    for (const std::string unchanged : {"未翻译", "相同", "空", ""}) {
+        text = unchanged;
+        if (rewriteCommit(translations, text) || text != unchanged) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool candidate_translator::cpp_candidate_validation_test() {

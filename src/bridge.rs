@@ -65,6 +65,8 @@ pub mod ffi {
         #[allow(dead_code)]
         fn cpp_candidate_validation_test() -> bool;
         #[allow(dead_code)]
+        fn cpp_commit_rewrite_test() -> bool;
+        #[allow(dead_code)]
         fn cpp_wait_for_results(translator: &Translator) -> Vec<TranslationResult>;
     }
 }
