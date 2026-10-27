@@ -78,6 +78,10 @@ Linux 上打开 `fcitx5-configtool`，返回主界面的“附加组件 / Addons
 - `Toggle translation commit`：`When toggled on` 模式下的切换快捷键，默认 `Control+Alt+J`。
 - `Translate the text before the cursor`：整句翻译快捷键，默认 `Control+Alt+Enter`，见下文。
 - `Maximum characters per sentence`：整句翻译最多取多少个字符，默认 120。
+- `Translation engine`：`AI model`（默认，走上面的 Base URL / Model）或 `Machine translation`（走专门的机器翻译接口，见下文）。
+- `Machine translation service`：机器翻译引擎，`Auto` / `Google Translate` / `MyMemory` / `LibreTranslate endpoint` / `DeepL`。
+- `LibreTranslate endpoint (or DeepL URL override)`：LibreTranslate 的 `/translate` 地址，默认 `http://127.0.0.1:5000/translate`；选 DeepL 时填这里可以覆盖官方端点。
+- `Machine translation API key`：DeepL 或自建 LibreTranslate 需要鉴权时填这里。
 
 三个接口字段默认留空，未填写完整前不会发送请求。API Key 按需求明文保存在 `~/.config/fcitx5/conf/candidate-translator.conf`；插件会尽力将该文件权限收紧为 `0600`，但仍不建议在共享账户中使用长期高权限密钥。
 
@@ -93,6 +97,25 @@ Linux 上打开 `fcitx5-configtool`，返回主界面的“附加组件 / Addons
 - 机制上不拦截接受候选的那次按键：fcitx5 的 `InputContext::commitString` 会把每个提交串送进 `Instance::CommitFilter`，插件用该输入框的「候选原文 → 译文」表做精确匹配，命中才替换。因此标点、英文、表情等非候选提交，以及译文与原文相同的情况都不会被改动。
 - 请求失败后插件会进入 3 秒冷却，冷却期间的新请求直接保留中文、不发网络请求；冷却不会因为新请求而延长，停止输入 3 秒后自动恢复。
 - 该模式依赖 fcitx5 5.1.20+，与具体输入法无关，fcitx5-pinyin、fcitx5-rime 等都能用；候选窗显示仍是候选级延迟，上屏只使用已经缓存的译文，不会为了上屏而同步请求接口。
+
+## 机器翻译
+
+`Translation engine` 选 `Machine translation` 后，插件不再调用 AI 接口，改用专门的翻译服务，延迟从 AI 的 1 秒级降到几百毫秒级（取决于服务和网络）。候选翻译、提交译文、整句翻译三条路径都走同一个引擎，行为不变。
+
+`Machine translation service` 的选项：
+
+- `Auto`（默认）：先试 Google，失败再试 MyMemory，两个都失败时把两条错误一起返回。
+- `Google Translate`：`translate.googleapis.com` 的免 key 接口。不需要配置，但共享 IP 容易被限流，返回 429 时会看到 `Google Translate returned HTTP 429`。
+- `MyMemory`：免 key，单次请求原文上限约 500 字节，超长句子会被拒；返回内容里带 `MYMEMORY WARNING` 时也视为失败。
+- `LibreTranslate endpoint`：填写自建实例的 `/translate` 地址。本地跑 LibreTranslate 或 argos-translate 时延迟通常在一两百毫秒，是最稳的选择；端点需要 key 时把 key 填到 `Machine translation API key`。
+- `DeepL`：需要 `Machine translation API key`，免费版 key 以 `:fx` 结尾时自动使用 `api-free.deepl.com`，否则用 `api.deepl.com`。所有候选会合并成一次请求批量翻译，是唯一走原生批量的引擎。
+
+几点约束：
+
+- 机器翻译模式下 `Base URL`、`Model`、`API Key`、`Reasoning effort` 都不再使用；切回 `AI model` 时照旧生效。
+- 缓存键里记录了引擎和后端地址，AI 与机器翻译的结果不会互相覆盖，切换引擎会重新请求。
+- 候选翻译仍然是并发请求（每批 4 个），整句翻译仍是单次请求；两者与 AI 模式共用冷却、超时和缓存逻辑。
+- 现在没有内置的本地推理引擎，要让机器翻译完全离线，可以自己在本地起 LibreTranslate 再把地址填进来。
 
 ## 整句翻译
 
@@ -112,6 +135,7 @@ Linux 上打开 `fcitx5-configtool`，返回主界面的“附加组件 / Addons
 - 缓存键包含 Base URL、模型、推理档位、目标语言和原文，换模型或换档位会各存一份。
 - DeepSeek 这类默认开启思考的模型，单次延迟主要来自推理本身：把 `Reasoning effort` 设为 `None`（或服务支持的最低档）能明显变快；整句请求本身已经限制了输出长度。
 - `Request timeout` 默认 8 秒；早期版本是 3 秒，慢模型（DeepSeek 思考模式）会被自己的超时打断。
+- 想再快一个数量级就把 `Translation engine` 切到 `Machine translation`：Google / MyMemory 是免 key 的公共接口，DeepL 和本地 LibreTranslate 更快，尤其本地实例通常在一两百毫秒内返回。
 
 ## 接口约定
 

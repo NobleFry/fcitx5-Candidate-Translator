@@ -46,6 +46,16 @@ enum class ReasoningEffortMode { Auto, None, Low, Medium };
 FCITX_CONFIG_ENUM_NAME_WITH_I18N(ReasoningEffortMode, N_("Auto"), N_("None"),
                                  N_("Low"), N_("Medium"))
 
+enum class TranslationProvider { Ai, Machine };
+FCITX_CONFIG_ENUM_NAME_WITH_I18N(TranslationProvider, N_("AI model"),
+                                 N_("Machine translation"))
+
+enum class MachineBackend { Auto, Google, MyMemory, LibreTranslate, DeepL };
+FCITX_CONFIG_ENUM_NAME_WITH_I18N(MachineBackend,
+                                 N_("Auto (Google, then MyMemory)"),
+                                 N_("Google Translate"), N_("MyMemory"),
+                                 N_("LibreTranslate endpoint"), N_("DeepL"))
+
 enum class CommitMode { Off, Toggle, Always };
 FCITX_CONFIG_ENUM_NAME_WITH_I18N(CommitMode, N_("Never"),
                                  N_("When toggled on"), N_("Always"))
@@ -78,6 +88,19 @@ FCITX_CONFIGURATION(
         fcitx::IntConstrain(0, 100000)};
     fcitx::Option<bool> clearCache{
         this, "ClearCache", _("Clear translation cache on Apply"), false};
+    fcitx::OptionWithAnnotation<TranslationProvider,
+                                TranslationProviderI18NAnnotation>
+        provider{this, "Provider", _("Translation engine"),
+                 TranslationProvider::Ai};
+    fcitx::OptionWithAnnotation<MachineBackend, MachineBackendI18NAnnotation>
+        machineBackend{this, "MachineBackend",
+                       _("Machine translation service"), MachineBackend::Auto};
+    fcitx::Option<std::string> machineUrl{
+        this, "MachineURL",
+        _("LibreTranslate endpoint (or DeepL URL override)"),
+        "http://127.0.0.1:5000/translate"};
+    fcitx::Option<std::string> machineKey{
+        this, "MachineAPIKey", _("Machine translation API key"), ""};
     fcitx::OptionWithAnnotation<CommitMode, CommitModeI18NAnnotation> commitMode{
         this, "CommitMode",
         _("Commit the translation instead of the typed Chinese"), CommitMode::Off};
@@ -342,8 +365,21 @@ private:
     }
 
     bool configured() const {
-        return *config_.enabled && !config_.baseUrl->empty() &&
-               !config_.model->empty() && !config_.apiKey->empty();
+        if (!*config_.enabled) {
+            return false;
+        }
+        if (*config_.provider == TranslationProvider::Machine) {
+            switch (*config_.machineBackend) {
+            case MachineBackend::LibreTranslate:
+                return !config_.machineUrl->empty();
+            case MachineBackend::DeepL:
+                return !config_.machineKey->empty();
+            default:
+                return true;
+            }
+        }
+        return !config_.baseUrl->empty() && !config_.model->empty() &&
+               !config_.apiKey->empty();
     }
 
     std::string reasoningEffort() const {
@@ -380,6 +416,11 @@ private:
             .debounce_ms = static_cast<std::uint64_t>(*config_.debounceMs),
             .cache_entries = static_cast<std::size_t>(*config_.cacheEntries),
             .cache_path = cachePath.string(),
+            .provider = *config_.provider == TranslationProvider::Machine ? 1
+                                                                         : 0,
+            .machine_backend = static_cast<std::int32_t>(*config_.machineBackend),
+            .machine_url = *config_.machineUrl,
+            .machine_key = *config_.machineKey,
         });
         const auto configPath =
             fcitx::StandardPaths::global()

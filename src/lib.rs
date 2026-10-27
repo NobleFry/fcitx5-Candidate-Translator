@@ -28,6 +28,13 @@ pub extern "C" fn fcitx_addon_factory_instance() -> *mut c_void {
     bridge::ffi::addon_factory().cast()
 }
 
+const PROVIDER_MACHINE: i32 = 1;
+const MACHINE_AUTO: i32 = 0;
+const MACHINE_GOOGLE: i32 = 1;
+const MACHINE_MYMEMORY: i32 = 2;
+const MACHINE_LIBRE: i32 = 3;
+const MACHINE_DEEPL: i32 = 4;
+
 #[derive(Clone, Debug, Default)]
 struct Config {
     enabled: bool,
@@ -40,14 +47,30 @@ struct Config {
     debounce: Duration,
     cache_entries: usize,
     cache_path: PathBuf,
+    provider: i32,
+    machine_backend: i32,
+    machine_url: String,
+    machine_key: String,
 }
 
 impl Config {
+    fn uses_machine(&self) -> bool {
+        self.provider == PROVIDER_MACHINE
+    }
+
     fn ready(&self) -> bool {
-        self.enabled
-            && !self.base_url.trim().is_empty()
-            && !self.model.trim().is_empty()
-            && !self.api_key.is_empty()
+        if !self.enabled {
+            return false;
+        }
+        if self.uses_machine() {
+            // Only the backends that need extra configuration must have it.
+            return match self.machine_backend {
+                MACHINE_LIBRE => !self.machine_url.trim().is_empty(),
+                MACHINE_DEEPL => !self.machine_key.trim().is_empty(),
+                _ => true,
+            };
+        }
+        !self.base_url.trim().is_empty() && !self.model.trim().is_empty() && !self.api_key.is_empty()
     }
 }
 
@@ -442,6 +465,17 @@ impl Drop for Translator {
 }
 
 fn cache_key(config: &Config, target: &str, source: &str) -> String {
+    if config.uses_machine() {
+        // Machine results come from a different engine, so they must not share
+        // entries with the AI model's output.
+        return serde_json::to_string(&[
+            "machine",
+            backend_key(config).as_str(),
+            target,
+            source,
+        ])
+        .unwrap_or_default();
+    }
     serde_json::to_string(&[
         config.base_url.trim_end_matches('/'),
         config.model.as_str(),
@@ -453,6 +487,13 @@ fn cache_key(config: &Config, target: &str, source: &str) -> String {
 }
 
 fn backend_key(config: &Config) -> String {
+    if config.uses_machine() {
+        return format!(
+            "machine\x1f{}\x1f{}",
+            config.machine_backend,
+            config.machine_url.trim_end_matches('/')
+        );
+    }
     format!(
         "{}\x1f{}",
         config.base_url.trim_end_matches('/'),
@@ -704,6 +745,277 @@ fn translate_sentence(
     parse_plain_translation(content, items)
 }
 
+fn machine_langs(target: &str) -> (&'static str, &'static str) {
+    if target.starts_with("Japanese") {
+        ("ja", "JA")
+    } else {
+        ("en", "EN")
+    }
+}
+
+fn machine_request_error(service: &str, error: reqwest::Error) -> String {
+    format!("{service} request failed: {error}")
+}
+
+fn machine_http_error(service: &str, status: reqwest::StatusCode, body: &str) -> String {
+    let detail: String = body.chars().take(200).collect();
+    format!("{service} failed with HTTP {status}: {detail}")
+}
+
+fn translate_google(client: &Client, target: &str, text: &str) -> Result<String, String> {
+    let (lang, _) = machine_langs(target);
+    let mut url = Url::parse("https://translate.googleapis.com/translate_a/single")
+        .map_err(|error| format!("invalid google translate URL: {error}"))?;
+    url.query_pairs_mut()
+        .append_pair("client", "gtx")
+        .append_pair("sl", "zh-CN")
+        .append_pair("tl", lang)
+        .append_pair("dt", "t")
+        .append_pair("q", text);
+    let response = client
+        .get(url)
+        .send()
+        .map_err(|error| machine_request_error("google translate", error))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .map_err(|error| machine_request_error("google translate", error))?;
+    if !status.is_success() {
+        return Err(machine_http_error("google translate", status, &body));
+    }
+    let value: Value = serde_json::from_str(&body)
+        .map_err(|error| format!("google translate returned invalid JSON: {error}"))?;
+    let segments = value
+        .get(0)
+        .and_then(Value::as_array)
+        .ok_or_else(|| "google translate returned no segments".to_string())?;
+    let mut translated = String::new();
+    for segment in segments {
+        if let Some(part) = segment.get(0).and_then(Value::as_str) {
+            translated.push_str(part);
+        }
+    }
+    let translated = translated.trim().to_string();
+    if translated.is_empty() {
+        return Err("google translate returned an empty translation".to_string());
+    }
+    Ok(translated)
+}
+
+fn translate_mymemory(client: &Client, target: &str, text: &str) -> Result<String, String> {
+    let (lang, _) = machine_langs(target);
+    let langpair = format!("zh-CN|{lang}");
+    let mut url = Url::parse("https://api.mymemory.translated.net/get")
+        .map_err(|error| format!("invalid mymemory URL: {error}"))?;
+    url.query_pairs_mut()
+        .append_pair("q", text)
+        .append_pair("langpair", &langpair);
+    let response = client
+        .get(url)
+        .send()
+        .map_err(|error| machine_request_error("mymemory", error))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .map_err(|error| machine_request_error("mymemory", error))?;
+    if !status.is_success() {
+        return Err(machine_http_error("mymemory", status, &body));
+    }
+    let value: Value = serde_json::from_str(&body)
+        .map_err(|error| format!("mymemory returned invalid JSON: {error}"))?;
+    let translated = value
+        .get("responseData")
+        .and_then(|data| data.get("translatedText"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if translated.is_empty() || translated.starts_with("MYMEMORY WARNING") {
+        return Err("mymemory returned no translation".to_string());
+    }
+    Ok(translated)
+}
+
+fn translate_libre(
+    client: &Client,
+    config: &Config,
+    target: &str,
+    text: &str,
+) -> Result<String, String> {
+    let (lang, _) = machine_langs(target);
+    let mut body = json!({
+        "q": text,
+        "source": "zh",
+        "target": lang,
+        "format": "text",
+    });
+    if !config.machine_key.is_empty() {
+        body["api_key"] = json!(config.machine_key);
+    }
+    let response = client
+        .post(&config.machine_url)
+        .json(&body)
+        .send()
+        .map_err(|error| machine_request_error("libretranslate", error))?;
+    let status = response.status();
+    let raw = response
+        .text()
+        .map_err(|error| machine_request_error("libretranslate", error))?;
+    if !status.is_success() {
+        return Err(machine_http_error("libretranslate", status, &raw));
+    }
+    let value: Value = serde_json::from_str(&raw)
+        .map_err(|error| format!("libretranslate returned invalid JSON: {error}"))?;
+    let translated = value
+        .get("translatedText")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            value
+                .as_array()
+                .and_then(|entries| entries.first())
+                .and_then(|entry| entry.get("translatedText"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if translated.is_empty() {
+        return Err("libretranslate returned an empty translation".to_string());
+    }
+    Ok(translated)
+}
+
+fn deepl_endpoint(config: &Config) -> String {
+    if !config.machine_url.is_empty() {
+        return config.machine_url.clone();
+    }
+    // Free DeepL keys end with ":fx"; they only work on the free host.
+    if config.machine_key.ends_with(":fx") {
+        "https://api-free.deepl.com/v2/translate".to_string()
+    } else {
+        "https://api.deepl.com/v2/translate".to_string()
+    }
+}
+
+fn translate_deepl(
+    client: &Client,
+    config: &Config,
+    target: &str,
+    texts: &[String],
+) -> Result<Vec<String>, String> {
+    let (_, deepl_lang) = machine_langs(target);
+    let mut form: Vec<(&str, String)> = texts.iter().map(|text| ("text", text.clone())).collect();
+    form.push(("target_lang", deepl_lang.to_string()));
+    form.push(("source_lang", "ZH".to_string()));
+    let encoded = url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(form.iter().map(|(key, value)| (*key, value.as_str())))
+        .finish();
+    let response = client
+        .post(deepl_endpoint(config))
+        .header(
+            "Authorization",
+            format!("DeepL-Auth-Key {}", config.machine_key),
+        )
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(encoded)
+        .send()
+        .map_err(|error| machine_request_error("deepl", error))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .map_err(|error| machine_request_error("deepl", error))?;
+    if !status.is_success() {
+        return Err(machine_http_error("deepl", status, &body));
+    }
+    let value: Value = serde_json::from_str(&body)
+        .map_err(|error| format!("deepl returned invalid JSON: {error}"))?;
+    let translations = value
+        .get("translations")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "deepl returned no translations".to_string())?;
+    let mut out = Vec::with_capacity(translations.len());
+    for entry in translations {
+        let text = entry
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        out.push(text);
+    }
+    Ok(out)
+}
+
+fn translate_machine_one(
+    client: &Client,
+    config: &Config,
+    target: &str,
+    text: &str,
+) -> Result<String, String> {
+    match config.machine_backend {
+        MACHINE_GOOGLE => translate_google(client, target, text),
+        MACHINE_MYMEMORY => translate_mymemory(client, target, text),
+        MACHINE_LIBRE => translate_libre(client, config, target, text),
+        MACHINE_DEEPL => translate_deepl(client, config, target, &[text.to_string()])
+            .map(|mut translations| translations.remove(0)),
+        // Auto: gtx is the fastest and needs no key, MyMemory is the fallback
+        // that still answers when Google rate-limits the client's address.
+        _ => translate_google(client, target, text).or_else(|google_error| {
+            translate_mymemory(client, target, text)
+                .map_err(|error| format!("{google_error}; {error}"))
+        }),
+    }
+}
+
+fn machine_translate(
+    config: &Config,
+    target: &str,
+    items: &[JobItem],
+) -> Result<Vec<(u32, String, String)>, String> {
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+    let client = http_client(config.timeout)?;
+    if config.machine_backend == MACHINE_DEEPL {
+        let texts: Vec<String> = items.iter().map(|item| item.source.clone()).collect();
+        let translated = translate_deepl(&client, config, target, &texts)?;
+        if translated.len() != items.len() {
+            return Err("deepl returned a mismatched number of translations".to_string());
+        }
+        return Ok(items
+            .iter()
+            .zip(translated)
+            .map(|(item, text)| (item.index, item.source.clone(), text))
+            .collect());
+    }
+    // Short round trips, so run a page of candidates concurrently instead of
+    // paying one latency after another.
+    let mut out = Vec::with_capacity(items.len());
+    for chunk in items.chunks(4) {
+        let results: Vec<Result<String, String>> = thread::scope(|scope| {
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|item| {
+                    let client = &client;
+                    scope.spawn(move || translate_machine_one(client, config, target, &item.source))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .unwrap_or_else(|_| Err("machine translation worker panicked".to_string()))
+                })
+                .collect()
+        });
+        for (item, result) in chunk.iter().zip(results) {
+            out.push((item.index, item.source.clone(), result?));
+        }
+    }
+    Ok(out)
+}
+
 fn translate_with_fallback(
     config: &Config,
     target: &str,
@@ -711,6 +1023,17 @@ fn translate_with_fallback(
     sentence: bool,
     try_structured_output: bool,
 ) -> Result<TranslationBatch, TranslationFailure> {
+    if config.uses_machine() {
+        return machine_translate(config, target, items)
+            .map(|translations| TranslationBatch {
+                translations,
+                structured_output_unsupported: false,
+            })
+            .map_err(|message| TranslationFailure {
+                message,
+                structured_output_unsupported: false,
+            });
+    }
     if sentence {
         return match translate_sentence(config, target, items) {
             Ok(translations) => Ok(TranslationBatch {
@@ -1062,6 +1385,10 @@ impl Translator {
             debounce: Duration::from_millis(config.debounce_ms.min(2_000)),
             cache_entries: config.cache_entries.min(100_000),
             cache_path: config.cache_path.into(),
+            provider: config.provider,
+            machine_backend: config.machine_backend,
+            machine_url: config.machine_url.trim().to_string(),
+            machine_key: config.machine_key.trim().to_string(),
         };
         let path = state.config.cache_path.clone();
         let limit = state.config.cache_entries;
@@ -1455,6 +1782,113 @@ mod tests {
         translator.clear_cache();
         assert!(translator.lookup("Japanese", "背单词").is_empty());
         server.join().unwrap();
+    }
+
+    #[test]
+    fn machine_backend_posts_each_candidate_to_libretranslate() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/translate", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let body = request_json(&read_http_request(&mut stream));
+                assert_eq!(body["source"], "zh");
+                assert_eq!(body["target"], "en");
+                assert_eq!(body["format"], "text");
+                let source = body["q"].as_str().unwrap().to_string();
+                write_json_response(
+                    &mut stream,
+                    "200 OK",
+                    &json!({"translatedText": format!("EN:{source}")}),
+                );
+            }
+        });
+        let translator = new_translator().unwrap();
+        translator.configure(BackendConfig {
+            provider: PROVIDER_MACHINE,
+            machine_backend: MACHINE_LIBRE,
+            machine_url: url,
+            ..backend_config("")
+        });
+        translator.submit(11, "English", items());
+        let results = bridge::ffi::cpp_wait_for_results(&translator);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].error.is_empty(), "{}", results[0].error);
+        let mut texts: Vec<String> = results[0]
+            .translations
+            .iter()
+            .map(|translation| translation.text.clone())
+            .collect();
+        texts.sort();
+        assert_eq!(texts, vec!["EN:背单词".to_string(), "EN:被单".to_string()]);
+        assert_eq!(translator.lookup("English", "背单词"), "EN:背单词");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn deepl_backend_translates_the_batch_in_one_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v2/translate", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            let headers = request.split_once("\r\n\r\n").unwrap().0;
+            assert!(
+                headers
+                    .to_ascii_lowercase()
+                    .contains("deepl-auth-key test-key:fx"),
+                "{headers}"
+            );
+            let body = request.split_once("\r\n\r\n").unwrap().1;
+            assert_eq!(
+                body.matches("text=").count(),
+                2,
+                "expected one form field per candidate: {body}"
+            );
+            write_json_response(
+                &mut stream,
+                "200 OK",
+                &json!({"translations": [{"text": "EN:背单词"}, {"text": "EN:被单"}]}),
+            );
+        });
+        let translator = new_translator().unwrap();
+        translator.configure(BackendConfig {
+            provider: PROVIDER_MACHINE,
+            machine_backend: MACHINE_DEEPL,
+            machine_key: "test-key:fx".into(),
+            machine_url: url,
+            ..backend_config("")
+        });
+        translator.submit(12, "English", items());
+        let results = bridge::ffi::cpp_wait_for_results(&translator);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].error.is_empty(), "{}", results[0].error);
+        assert_eq!(results[0].translations.len(), 2);
+        assert_eq!(results[0].translations[0].text, "EN:背单词");
+        assert_eq!(results[0].translations[1].text, "EN:被单");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn machine_cache_does_not_share_entries_with_the_ai_model() {
+        let mut ai = Config::default();
+        ai.base_url = "https://example.invalid/".into();
+        ai.model = "test".into();
+        ai.reasoning_effort = "auto".into();
+        let mut machine = ai.clone();
+        machine.provider = PROVIDER_MACHINE;
+        machine.machine_backend = MACHINE_MYMEMORY;
+        assert_ne!(
+            cache_key(&ai, "English", "背单词"),
+            cache_key(&machine, "English", "背单词")
+        );
+        // Switching machine backend also invalidates the cached text.
+        let mut other = machine.clone();
+        other.machine_backend = MACHINE_GOOGLE;
+        assert_ne!(
+            cache_key(&machine, "English", "背单词"),
+            cache_key(&other, "English", "背单词")
+        );
     }
 
     #[test]

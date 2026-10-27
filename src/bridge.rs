@@ -14,6 +14,12 @@ pub mod ffi {
         debounce_ms: u64,
         cache_entries: usize,
         cache_path: String,
+        // 0 = AI model, 1 = machine translation.
+        provider: i32,
+        // 0 = auto, 1 = Google, 2 = MyMemory, 3 = LibreTranslate, 4 = DeepL.
+        machine_backend: i32,
+        machine_url: String,
+        machine_key: String,
     }
 
     #[derive(Clone, Debug)]
